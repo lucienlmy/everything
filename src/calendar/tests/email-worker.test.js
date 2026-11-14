@@ -10,13 +10,23 @@ const RAW = readFileSync(
   'utf8',
 );
 
+// What /whoami says of a permanent account with a confirmed email — the only
+// kind the worker sends for.
+const ACCOUNT = {
+  uuid: 'user-uuid-1',
+  username: 'host',
+  email: 'host@example.com',
+  is_temp: false,
+  email_confirmed: true,
+};
+
 // The session's own word on who is calling: the worker builds Reply-To from
 // `username` and accepts `email` (or <username>@puter.email) as the organizer.
 const CALLER = {
   uuid: 'user-uuid-1',
   username: 'host',
   email: 'host@example.com',
-  puter: { authToken: 'caller-token' },
+  puter: { authToken: 'caller-token', auth: { getUser: async () => ACCOUNT } },
 };
 
 const LINK = 'https://cal-rsvp-abc123.puter.work/rsvp/' + 'a'.repeat(40);
@@ -127,7 +137,7 @@ describe('email worker: access', () => {
       // No uuid/username on the context object itself.
       puter: {
         ...world.caller.puter,
-        auth: { getUser: async () => ({ uuid: 'user-uuid-9', username: 'nine', email: 'host@example.com' }) },
+        auth: { getUser: async () => ({ ...ACCOUNT, uuid: 'user-uuid-9', username: 'nine' }) },
       },
     };
     expect((await (await post(world, payload(), { user: anonymous })).json()).sent).toBe(1);
@@ -144,7 +154,8 @@ describe('email worker: access', () => {
 
   it('refuses a session it cannot pin to a person, rather than sharing a bucket', async () => {
     const world = loadWorker();
-    const faceless = { puter: { ...world.caller.puter } }; // no id, no auth handle
+    const { auth, ...puter } = world.caller.puter;
+    const faceless = { puter }; // no id, no auth handle
     const res = await post(world, payload(), { user: faceless });
     expect(res.status).toBe(401);
     expect((await res.json())).toMatchObject({ error: 'sign_in_required', detail: 'no_identity' });
@@ -395,13 +406,71 @@ describe('email worker: never send the same thing twice', () => {
   });
 });
 
+describe('email worker: only a verified account sends', () => {
+  const asAccount = (who) => ({
+    uuid: CALLER.uuid,
+    username: CALLER.username,
+    puter: { ...CALLER.puter, auth: { getUser: async () => who } },
+  });
+  const refused = async (world, user, detail) => {
+    for (const route of ['/invites', '/cancellations', '/replies']) {
+      const res = await world.worker.call('POST', route, { json: payload(), user });
+      expect(res.status).toBe(403);
+      expect(await res.json()).toEqual({ error: 'account_not_verified', detail });
+    }
+    expect(world.sent).toHaveLength(0);
+  };
+
+  it('refuses a temporary account, which takes no signup to get', async () => {
+    const world = loadWorker();
+    await refused(world, asAccount({ ...ACCOUNT, email: null, is_temp: true }), 'temporary_account');
+    // Not being told is not being told "permanent".
+    await refused(world, asAccount({ ...ACCOUNT, is_temp: undefined }), 'temporary_account');
+  });
+
+  it('refuses an account whose email is still awaiting confirmation', async () => {
+    const world = loadWorker();
+    await refused(
+      world,
+      asAccount({ ...ACCOUNT, requires_email_confirmation: 1, email_confirmed: 0 }),
+      'email_unconfirmed',
+    );
+  });
+
+  it('asks a session whose account cannot be read to sign in again', async () => {
+    const world = loadWorker();
+    const failing = asAccount(null);
+    failing.puter.auth.getUser = async () => {
+      throw new Error('whoami unreachable');
+    };
+    const unreadable = [{ uuid: CALLER.uuid, username: CALLER.username, puter: { authToken: 't' } }, failing];
+    for (const user of unreadable) {
+      const res = await post(world, payload(), { user });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'sign_in_required', detail: 'no_account' });
+    }
+    expect(world.sent).toHaveLength(0);
+  });
+
+  it('sends for an older account that was never asked to confirm', async () => {
+    const world = loadWorker();
+    // The unconfirmed address is still not one the mail may name as organizer.
+    const asMailbox = payload({ event: { ...payload().event, organizerEmail: 'host@puter.email' } });
+    const res = await post(world, asMailbox, {
+      user: asAccount({ ...ACCOUNT, requires_email_confirmation: 0, email_confirmed: 0 }),
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()).sent).toBe(1);
+  });
+});
+
 describe('email worker: the organizer must be the caller', () => {
   // An account whose address is only reachable through its own Puter.
   const asUser = (email) => ({
     uuid: CALLER.uuid,
     puter: {
       ...CALLER.puter,
-      auth: { getUser: async () => ({ uuid: CALLER.uuid, username: CALLER.username, email }) },
+      auth: { getUser: async () => ({ ...ACCOUNT, email }) },
     },
   });
 
@@ -442,12 +511,7 @@ describe('email worker: the organizer must be the caller', () => {
       puter: {
         ...CALLER.puter,
         auth: {
-          getUser: async () => ({
-            uuid: CALLER.uuid,
-            username: 'host',
-            email: 'ceo@bank.example',
-            email_confirmed: false,
-          }),
+          getUser: async () => ({ ...ACCOUNT, email: 'ceo@bank.example', email_confirmed: false }),
         },
       },
     };
@@ -472,7 +536,7 @@ describe('email worker: the organizer must be the caller', () => {
     const world = loadWorker();
     const nameless = {
       uuid: CALLER.uuid,
-      puter: { ...CALLER.puter, auth: { getUser: async () => ({ uuid: CALLER.uuid, email: 'host@example.com' }) } },
+      puter: { ...CALLER.puter, auth: { getUser: async () => ({ ...ACCOUNT, username: undefined }) } },
     };
     for (const route of ['/invites', '/cancellations', '/replies']) {
       const res = await world.worker.call('POST', route, { json: payload(), user: nameless });
@@ -718,7 +782,11 @@ describe('email worker: cancellations', () => {
   it('still notifies guests when no host email is available', async () => {
     const world = loadWorker();
     const res = await postCancel(world, payload({ event: { ...payload().event, organizerEmail: '' } }), {
-      user: { ...world.caller, email: '' },
+      user: {
+        ...world.caller,
+        email: '',
+        puter: { ...world.caller.puter, auth: { getUser: async () => ({ ...ACCOUNT, email: undefined }) } },
+      },
     });
     expect((await res.json()).sent).toBe(1);
     expect(world.sent[0].to).toBe('ada@example.com');
@@ -945,7 +1013,7 @@ describe('email worker: replies (the /replies fallback for mail-received invitat
     uuid: CALLER.uuid,
     puter: {
       ...CALLER.puter,
-      auth: { getUser: async () => ({ uuid: CALLER.uuid, username: CALLER.username, email }) },
+      auth: { getUser: async () => ({ ...ACCOUNT, email }) },
     },
   });
 
@@ -986,10 +1054,10 @@ describe('email worker: replies (the /replies fallback for mail-received invitat
   const postReply = (world, body = replyPayload(), user = world.caller) =>
     world.worker.call('POST', '/replies', { json: body, user });
 
-  it('reports version 12 from /health', async () => {
+  it('reports version 13 from /health', async () => {
     const world = loadWorker();
     const res = await world.worker.call('GET', '/health');
-    expect((await res.json())).toMatchObject({ ok: true, version: '12' });
+    expect((await res.json())).toMatchObject({ ok: true, version: '13' });
   });
 
   it('composes and sends a reply to the organizer, with no links anywhere', async () => {

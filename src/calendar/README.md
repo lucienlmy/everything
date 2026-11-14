@@ -278,7 +278,9 @@ Because that worker is app-owned and reachable by any signed-in Puter user, it i
 not a relay: callers hand it an *event*, never a message. It composes the subject
 and body itself, escapes everything the host typed, and puts no clickable link in
 the mail except the guest's own `*.puter.work` RSVP URL (a cancellation carries no
-link at all) — with per-request and per-user-per-day recipient caps on top. Its
+link at all) — with per-request and per-user-per-day recipient caps on top. It
+sends only for a permanent account whose email is not awaiting confirmation; a
+temporary account gets `403 account_not_verified`. Its
 storage holds only hashes: no address, event id, or title ever lands in the app
 owner's account.
 
@@ -291,7 +293,7 @@ Invitations are the one feature that needs a deploy step of its own. With the
 npm install -g @heyputer/cli
 puter login
 npm run deploy:email-worker   # puter worker deploy src/workers/email-worker.js calendar-email
-curl https://calendar-email.puter.work/health   # {"ok":true,"version":"12","runtime":"2.6.2+63f857ce3"}
+curl https://calendar-email.puter.work/health   # {"ok":true,"version":"13","runtime":"2.6.2+63f857ce3"}
 ```
 
 The version in `/health` is `WORKER_VERSION` from the source — bump it in any
@@ -302,7 +304,8 @@ no `/replies`, so answering a mail-received invitation reports the same thing
 when `puter.email.send` cannot carry the reply itself. Older than `12` takes
 Reply-To from the request and skips the organizer check whenever Puter shares
 no account email, which lets a signed-in user send mail that names someone else
-as its host.
+as its host. Older than `13` sends for any session, including the temporary
+accounts Puter hands out without a signup.
 
 `runtime` is the puter.js build Puter baked into the worker at deploy time; it
 only changes when the source is redeployed. When puter.js changes under the

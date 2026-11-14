@@ -115,8 +115,16 @@ function makeWorld({
     return emailWorker.call(init.method || 'GET', parsed.pathname + parsed.search, {
       headers: init.headers || {},
       body: init.body,
-      // The worker's view of the session: it builds Reply-To from the username.
-      user: { ...HOST, username: 'host', puter: { authToken: 'caller-token' } },
+      // The worker's view of the session: it builds Reply-To from the username,
+      // and sends only for an account /whoami calls permanent.
+      user: {
+        ...HOST,
+        username: 'host',
+        puter: {
+          authToken: 'caller-token',
+          auth: { getUser: async () => ({ ...HOST, username: 'host', is_temp: false, email_confirmed: true }) },
+        },
+      },
     });
   });
 
