@@ -27,6 +27,8 @@
  * cannon wearing the calendar's sending reputation, so it never does:
  *   - no Puter session, no send. `user` is only populated for callers that
  *     come through puter.workers.exec(); everyone else gets 401.
+ *   - no real account, no send. A temporary account, or one whose email is
+ *     still unconfirmed, gets 403 account_not_verified (accountProblemOf).
  *   - the caller supplies an EVENT, not an email. Subject and body are
  *     composed here, so every message this worker can be made to send is an
  *     invitation to something, addressed to that event's guests.
@@ -79,7 +81,10 @@
 //      from the request; the organizer (and, on /replies, the attendee) must
 //      be one of the caller's own addresses; and a session that cannot be
 //      pinned to a username is refused instead of being taken at its word.
-const WORKER_VERSION = '12';
+// '13': a session is not enough to send: the account must be a permanent one
+//      whose email is not awaiting confirmation (403 account_not_verified).
+//      A temporary account takes no signup, so anyone could mint one and mail.
+const WORKER_VERSION = '13';
 
 const SENT_PREFIX = 'mail:sent:';
 const RATE_PREFIX = 'mail:rate:';
@@ -181,6 +186,34 @@ async function callerAddressesOf(caller) {
 /** Is `address` one of the caller's own (see callerAddressesOf)? */
 function isCallerAddress(self, address) {
   return Boolean(address) && (address === self.mailbox || address === self.email);
+}
+
+/**
+ * Why this account may not send — '' when it may. Any Puter session reaches
+ * this worker, and a temporary account is handed out with no signup at all, so
+ * a session alone is not a person. The account must be permanent, and its email
+ * must not be awaiting confirmation (the platform's own verified-account rule).
+ * Asked of the caller's own Puter; one that does not answer vouches for nobody.
+ */
+async function accountProblemOf(caller) {
+  const p = caller && caller.puter;
+  let who = null;
+  try {
+    who = p && p.auth && typeof p.auth.getUser === 'function' ? await p.auth.getUser() : null;
+  } catch {
+    /* refused below */
+  }
+  if (!who) return 'no_account';
+  if (who.is_temp !== false) return 'temporary_account';
+  if (who.requires_email_confirmation && !who.email_confirmed) return 'email_unconfirmed';
+  return '';
+}
+
+/** The refusal for an accountProblemOf() answer. An account that could not be
+ *  read is a session problem (401), not a verdict on the account (403). */
+function accountRefusal(problem) {
+  if (problem === 'no_account') return json({ error: 'sign_in_required', detail: problem }, 401);
+  return json({ error: 'account_not_verified', detail: problem }, 403);
 }
 
 function kvOf(ctx) {
@@ -755,6 +788,8 @@ router.get('/whoami', async (ctx) => {
     identified: Boolean(await callerIdOf(caller)),
     // Whether a Reply-To can be built for this session (presence only).
     hasMailbox: Boolean((await callerAddressesOf(caller)).mailbox),
+    // '' when this account may send, else why not (see accountProblemOf).
+    accountProblem: caller ? await accountProblemOf(caller) : 'no_caller',
     owner: {
       email: Boolean(ownerOf(ctx) && ownerOf(ctx).puter && ownerOf(ctx).puter.email),
       authToken: Boolean(ownerOf(ctx) && ownerOf(ctx).puter && ownerOf(ctx).puter.authToken),
@@ -786,6 +821,8 @@ async function deliver(ctx, forcedKind = '') {
   if (!callerId) return json({ error: 'sign_in_required', detail: 'no_identity' }, 401);
   const self = await callerAddressesOf(caller);
   if (!self.mailbox) return json({ error: 'sign_in_required', detail: 'no_username' }, 401);
+  const problem = await accountProblemOf(caller);
+  if (problem) return accountRefusal(problem);
 
   let body = null;
   try {
@@ -1048,6 +1085,8 @@ async function deliverReply(ctx) {
   if (!callerId) return json({ error: 'sign_in_required', detail: 'no_identity' }, 401);
   const self = await callerAddressesOf(caller);
   if (!self.mailbox) return json({ error: 'sign_in_required', detail: 'no_username' }, 401);
+  const problem = await accountProblemOf(caller);
+  if (problem) return accountRefusal(problem);
 
   let body = null;
   try {

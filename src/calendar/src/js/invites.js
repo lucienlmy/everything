@@ -70,6 +70,10 @@ const SENT_PREFIX = 'cal:invite:';
 export const NO_HOST_EMAIL =
   'Invitations need your email address so guests can see who invited them. Allow Calendar to read it, then send again.';
 
+/** The worker's answer to a temporary account, or one with an unconfirmed email. */
+export const ACCOUNT_NOT_VERIFIED =
+  'Sending email needs a Puter account with a confirmed email address. Create one or confirm yours, then send again.';
+
 /** A stored or reported address, or '' for anything that isn't one. */
 function normalizeEmail(value) {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
@@ -780,6 +784,7 @@ export function createInvites({
     if (status === 401 || code === 'sign_in_required') {
       return 'Sign in to Puter again to send the cancellation.';
     }
+    if (code === 'account_not_verified') return ACCOUNT_NOT_VERIFIED;
     if (status === 429 || code === 'daily_limit') {
       return "You've reached today's email limit. Try again tomorrow.";
     }
@@ -867,6 +872,7 @@ export function createInvites({
       return "You've reached today's invitation limit. Try again tomorrow.";
     }
     if (status === 404) return 'The invitation service is unavailable right now.';
+    if (code === 'account_not_verified') return ACCOUNT_NOT_VERIFIED;
     // The worker binds the mail's organizer to the signed-in account; a
     // mismatch means the session and this window disagree about who that is.
     if (status === 403 || code === 'organizer_mismatch') {
