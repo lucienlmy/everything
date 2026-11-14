@@ -228,14 +228,21 @@ Edits to individual recurring occurrences also mark invitations as needing an
 update; local colors and reminders do not. Booked appointments retain their
 separate schedule and the warning that moving them does not notify the guest.
 
-Every invitation names its host. The mail's Reply-To and the .ics `ORGANIZER` are
-the signed-in account's email — what the guest's calendar shows as the organizer
-(Google Calendar files an event without one under
+Every invitation names its host. The .ics `ORGANIZER` is the signed-in
+account's email — what the guest's calendar shows as the organizer (Google
+Calendar files an event without one under
 `unknownorganizer@calendar.google.com`) and where their mail client's own RSVP
 buttons answer. Puter withholds that address until the user allows the app to
 read it, so a send that doesn't know it asks — on a press of **Email
 invitations**, never from the after-save send, which the editor has just asked
 for — and if there is still no address, nothing is sent and the toast says why.
+
+The email worker takes none of that on trust. It reads the sender's identity
+from their Puter session, never from the request: the mail's Reply-To is always
+the sender's own `<username>@puter.email`, and an organizer that is neither
+that mailbox nor the account's confirmed email is refused (`organizer_mismatch`)
+— including when Puter shares no account email to compare against. A session
+the worker cannot pin to a username sends nothing.
 
 **Cancelling.** Deleting an event whose guests were emailed asks one more
 question — **Send cancellation emails?** — because to those guests the event is
@@ -284,7 +291,7 @@ Invitations are the one feature that needs a deploy step of its own. With the
 npm install -g @heyputer/cli
 puter login
 npm run deploy:email-worker   # puter worker deploy src/workers/email-worker.js calendar-email
-curl https://calendar-email.puter.work/health   # {"ok":true,"version":"11","runtime":"2.6.2+63f857ce3"}
+curl https://calendar-email.puter.work/health   # {"ok":true,"version":"12","runtime":"2.6.2+63f857ce3"}
 ```
 
 The version in `/health` is `WORKER_VERSION` from the source — bump it in any
@@ -292,7 +299,10 @@ deploy that changes behavior, and check it after deploying. A deployment older
 than `4` has no `/cancellations` route: deleting an invited event then reports
 that the email service needs an update, and sends nothing. Older than `11` has
 no `/replies`, so answering a mail-received invitation reports the same thing
-when `puter.email.send` cannot carry the reply itself.
+when `puter.email.send` cannot carry the reply itself. Older than `12` takes
+Reply-To from the request and skips the organizer check whenever Puter shares
+no account email, which lets a signed-in user send mail that names someone else
+as its host.
 
 `runtime` is the puter.js build Puter baked into the worker at deploy time; it
 only changes when the source is redeployed. When puter.js changes under the

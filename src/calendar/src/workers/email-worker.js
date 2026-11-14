@@ -74,7 +74,12 @@
 //      email.sendTransactional); /health and /whoami now report it as runtime.
 // '11': POST /replies — an iTIP REPLY to an invitation the calendar received
 //      by mail, for when the user's own puter.email.send cannot carry it.
-const WORKER_VERSION = '11';
+// '12': the sender's identity comes from their Puter session alone. Reply-To
+//      is always the caller's own <username>@puter.email, never an address
+//      from the request; the organizer (and, on /replies, the attendee) must
+//      be one of the caller's own addresses; and a session that cannot be
+//      pinned to a username is refused instead of being taken at its word.
+const WORKER_VERSION = '12';
 
 const SENT_PREFIX = 'mail:sent:';
 const RATE_PREFIX = 'mail:rate:';
@@ -132,17 +137,50 @@ async function callerIdOf(caller) {
   }
 }
 
-/** The caller's own address, when the platform can tell us — '' otherwise. */
-async function callerEmailOf(caller) {
-  if (!caller) return '';
-  if (typeof caller.email === 'string' && caller.email) return lowerEmail(caller.email);
+/** A Puter username, lowercased, if it is one an address can be built from. */
+function usernameOf(value) {
+  const name = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(name) ? name : '';
+}
+
+/**
+ * Who the caller is, in the two addresses a mail may speak for them as —
+ * read from their Puter session and NEVER from the request body:
+ *
+ *   mailbox  `<username>@puter.email`, the address Puter itself gives the
+ *            account. It is every mail's Reply-To: derived here, so no request
+ *            can aim a guest's reply at an address of the sender's choosing.
+ *   email    the account's own email, when the platform shares it (it is
+ *            withheld until the user lets the app read it) and has not marked
+ *            it unconfirmed — an address nobody proved they own names nobody.
+ *
+ * Like the id (callerIdOf), the username is usually not sitting on the caller
+ * object, so the caller's own Puter is asked. No username means no mailbox,
+ * and the routes refuse to send rather than fall back to what the body says.
+ */
+async function callerAddressesOf(caller) {
+  if (!caller) return { mailbox: '', email: '' };
   const p = caller.puter;
-  try {
-    const who = p && p.auth && typeof p.auth.getUser === 'function' ? await p.auth.getUser() : null;
-    return who && typeof who.email === 'string' ? lowerEmail(who.email) : '';
-  } catch {
-    return '';
+  let username = usernameOf(caller.username) || usernameOf(p && p.username);
+  let email = typeof caller.email === 'string' ? lowerEmail(caller.email) : '';
+  if (!username || !email) {
+    try {
+      const who = p && p.auth && typeof p.auth.getUser === 'function' ? await p.auth.getUser() : null;
+      if (who) {
+        username = username || usernameOf(who.username);
+        const unconfirmed = who.email_confirmed === false || who.email_confirmed === 0;
+        if (!email && !unconfirmed && typeof who.email === 'string') email = lowerEmail(who.email);
+      }
+    } catch {
+      /* an unreachable /whoami names nobody */
+    }
   }
+  return { mailbox: username ? `${username}@puter.email` : '', email };
+}
+
+/** Is `address` one of the caller's own (see callerAddressesOf)? */
+function isCallerAddress(self, address) {
+  return Boolean(address) && (address === self.mailbox || address === self.email);
 }
 
 function kvOf(ctx) {
@@ -715,6 +753,8 @@ router.get('/whoami', async (ctx) => {
       auth: Boolean(p && p.auth && typeof p.auth.getUser === 'function'),
     },
     identified: Boolean(await callerIdOf(caller)),
+    // Whether a Reply-To can be built for this session (presence only).
+    hasMailbox: Boolean((await callerAddressesOf(caller)).mailbox),
     owner: {
       email: Boolean(ownerOf(ctx) && ownerOf(ctx).puter && ownerOf(ctx).puter.email),
       authToken: Boolean(ownerOf(ctx) && ownerOf(ctx).puter && ownerOf(ctx).puter.authToken),
@@ -744,6 +784,8 @@ async function deliver(ctx, forcedKind = '') {
   }
   const callerId = await callerIdOf(caller);
   if (!callerId) return json({ error: 'sign_in_required', detail: 'no_identity' }, 401);
+  const self = await callerAddressesOf(caller);
+  if (!self.mailbox) return json({ error: 'sign_in_required', detail: 'no_username' }, 401);
 
   let body = null;
   try {
@@ -754,13 +796,14 @@ async function deliver(ctx, forcedKind = '') {
   const req = readRequest(body, forcedKind);
   if (req.error) return json(req.reason ? { error: req.error, reason: req.reason } : { error: req.error }, 400);
 
-  // The organizer a mail speaks for — its Reply-To, its .ics ORGANIZER, the
-  // "<name> invited you" line — must be the caller, whenever the platform can
-  // say who that is. This worker answers any signed-in Puter user; without
-  // the check anyone could put the calendar's sender behind a mail whose
-  // replies and RSVP answers went to an address of their choosing.
-  const callerEmail = await callerEmailOf(caller);
-  if (callerEmail && req.event.organizerEmail && req.event.organizerEmail !== callerEmail) {
+  // The organizer a mail speaks for — its .ics ORGANIZER, the "Organizer"
+  // line, where a mail client's own RSVP buttons answer — must be one of the
+  // caller's own addresses. This worker answers any signed-in Puter user;
+  // without the check anyone could put the calendar's sender behind a mail
+  // that names someone else as its host. An address the session cannot vouch
+  // for is refused, not waved through: "the platform did not say" is exactly
+  // the case a forged organizer would arrive in.
+  if (req.event.organizerEmail && !isCallerAddress(self, req.event.organizerEmail)) {
     return json({ error: 'organizer_mismatch' }, 403);
   }
 
@@ -768,7 +811,7 @@ async function deliver(ctx, forcedKind = '') {
   // batches. Sending the host through the same loop applies the normal quota,
   // failure reporting and retry deduplication without dropping a guest.
   if (req.kind === 'cancel' && !req.removedGuests) {
-    const email = req.event.organizerEmail || callerEmail;
+    const email = req.event.organizerEmail || self.email;
     if (email) {
       const existing = req.recipients.find((recipient) => recipient.email === email);
       if (existing) existing.isHost = true;
@@ -809,7 +852,9 @@ async function deliver(ctx, forcedKind = '') {
 
   const subject = subjectFor(req);
   const attachments = attachmentsFor(req);
-  const replyTo = req.event.organizerEmail || undefined;
+  // Never from the request: a guest's reply goes to the Puter account that
+  // sent the mail, whatever the event claims about its host.
+  const replyTo = self.mailbox;
   let sent = 0;
   let cost = 0;
 
@@ -988,13 +1033,11 @@ function attachmentsForReply(req) {
  * event, an attendee and a PARTSTAT; this worker composes the message and reads
  * (never relays) the caller's own .ics.
  *
- * `attendee.email` must be the caller answering for THEMSELVES — checked
- * against `callerEmailOf`, the account email, when the platform can name it.
- * That can legitimately differ from the caller's `<username>@puter.email`
- * mailbox address (the address a mail-received invitation was actually made out
- * to), so a mismatch is only refused when attendee.email is neither the account
- * email nor that mailbox address — otherwise nobody could ever reply as the
- * very address their invitation was sent to.
+ * `attendee.email` must be the caller answering for THEMSELVES: one of the two
+ * addresses callerAddressesOf reads from their session — the account email, or
+ * the `<username>@puter.email` mailbox a mail-received invitation was actually
+ * made out to. Anything else is refused, including when the platform shares no
+ * account email to compare against.
  */
 async function deliverReply(ctx) {
   const caller = callerOf(ctx);
@@ -1003,6 +1046,8 @@ async function deliverReply(ctx) {
   }
   const callerId = await callerIdOf(caller);
   if (!callerId) return json({ error: 'sign_in_required', detail: 'no_identity' }, 401);
+  const self = await callerAddressesOf(caller);
+  if (!self.mailbox) return json({ error: 'sign_in_required', detail: 'no_username' }, 401);
 
   let body = null;
   try {
@@ -1015,10 +1060,7 @@ async function deliverReply(ctx) {
     return json(req.reason ? { error: req.error, reason: req.reason } : { error: req.error }, 400);
   }
 
-  const callerEmail = await callerEmailOf(caller);
-  const callerUsername = (caller && caller.username) || '';
-  const selfMailbox = callerUsername ? `${callerUsername.toLowerCase()}@puter.email` : '';
-  if (callerEmail && req.attendee.email !== callerEmail && req.attendee.email !== selfMailbox) {
+  if (!isCallerAddress(self, req.attendee.email)) {
     return json({ error: 'attendee_mismatch' }, 403);
   }
 
@@ -1051,6 +1093,7 @@ async function deliverReply(ctx) {
         subject: line(`${PARTSTAT_LABEL[req.partstat]}: ${req.event.title}`, 200),
         text: replyPlainBody(req),
         html: replyHtmlBody(req),
+        replyTo: self.mailbox,
         attachments: attachmentsForReply(req),
       })) || {};
     if ((out.suppressed || []).includes(req.event.organizerEmail)) {

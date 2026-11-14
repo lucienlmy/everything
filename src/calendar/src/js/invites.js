@@ -21,8 +21,9 @@
  *
  * Every message names its host. The .ics ORGANIZER is what the guest's
  * calendar shows as the organizer (Google Calendar files one without it under
- * "unknownorganizer@calendar.google.com"), Reply-To is where their mail
- * client's own RSVP buttons answer, and the body says who invited them. Puter
+ * "unknownorganizer@calendar.google.com") and where their mail client's own
+ * RSVP buttons answer, and the body says who invited them. Reply-To is not
+ * ours to set: the worker makes it the sender's <username>@puter.email. Puter
  * withholds the account's email until the user grants it, so an event saved
  * while that was unknown carries no organizer (modal.js saves rather than lose
  * the edit); a send resolves the address then — silently when the grant has
@@ -433,8 +434,8 @@ export function createInvites({
     if (!canSend()) return { ok: true, sent: 0, skipped: 0, failed: 0, results: [] };
     const ev = ownerEvent(item);
     if (!ev || !planFor(item).eventId) throw new Error('Only the organizer can send invitations.');
-    // The mail speaks for its host — .ics ORGANIZER, Reply-To, "<host> invited
-    // you" — and an event saved while my address was unknown carries none.
+    // The mail speaks for its host — .ics ORGANIZER, "<host> invited you" —
+    // and an event saved while my address was unknown carries none.
     // Resolve it before the plan is read (its digests include the address), or
     // refuse: an anonymous invitation files under an unknown organizer in the
     // guest's calendar and gives their RSVP buttons nobody to answer.
